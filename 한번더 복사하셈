@@ -1,143 +1,356 @@
-# slip_repeat_sim.py
+"""
+pybullet_slip_gui.py
+
+Requirements:
+    pip install pybullet matplotlib
+
+Usage:
+    python pybullet_slip_gui.py
+
+This script runs PyBullet simulations in DIRECT (no separate PyBullet GUI window)
+and provides a Tkinter GUI with:
+ - Run (single simulation)
+ - Repeat N times
+ - Reset statistics
+It displays a bar chart (matplotlib) showing slip counts / slip rate per tile type.
+
+Notes:
+ - Simulation and GUI run concurrently using a background thread to avoid blocking the Tkinter mainloop.
+ - The slip model is probabilistic and simplified for demonstrative purposes.
+"""
+
+import threading
+import time
+import math
+import random
+import queue
+import tkinter as tk
+from tkinter import ttk, messagebox
+
 import pybullet as p
 import pybullet_data
-import time
-import random
-import math
+import matplotlib
+matplotlib.use("TkAgg")
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
-# --- 설정 ---
-MU_SAFE = 0.42
-BASE_PROB = 0.6
-V_REF = 1.0
-WET_FACTOR = 1.8
+# ---------------- Simulation parameters ----------------
+MU_SAFE = 0.42             # safety threshold
+BASE_PROB = 0.6            # base slip probability coefficient
+V_REF = 1.0                # reference speed (m/s)
+WET_FACTOR = 1.8           # multiplier when wet; simple model
 
 TILE_SIZE = 1.0
-GRID_W, GRID_H = 4, 3
-SIM_STEP = 1./240.
-SIM_DURATION = 10  # 시뮬레이션 1회당 시간(초)
+GRID_W = 4
+GRID_H = 3
 
+SIM_STEP = 1. / 240.
+SIM_DURATION = 6.0  # seconds per run
+
+# Tile types and representative mu (DCOF-like)
 TILE_TYPES = {
     "polished_marble": 0.28,
     "glazed_porcelain": 0.35,
     "matte_porcelain": 0.48,
-    "quarry_tile": 0.6,
+    "quarry_tile": 0.60,
     "terracotta": 0.55,
     "vinyl": 0.38,
-    "concrete_wet": 0.2
+    "concrete_wet": 0.20
 }
+# For display ordering
+TILE_ORDER = list(TILE_TYPES.keys())
 
-# --- 함수들 ---
-def slip_risk_from_mu(mu):
+# ---------------- Helper functions for slip model ----------------
+def slip_risk_from_mu(mu: float) -> float:
+    """Normalized risk 0..1 based on safety threshold."""
     return max(0.0, (MU_SAFE - mu) / MU_SAFE)
 
-def compute_p_slip(mu, v):
+def compute_p_slip(mu: float, tangential_speed: float, wet: bool=False) -> float:
     R = slip_risk_from_mu(mu)
-    speed_factor = min(2.0, v / V_REF)
-    return BASE_PROB * R * speed_factor * WET_FACTOR
+    speed_factor = min(2.0, tangential_speed / V_REF)
+    wet_factor_local = WET_FACTOR if wet else 1.0
+    p_slip = BASE_PROB * R * speed_factor * wet_factor_local
+    return max(0.0, min(1.0, p_slip))
 
-# --- PyBullet 초기화 ---
-p.connect(p.GUI)
-p.setAdditionalSearchPath(pybullet_data.getDataPath())
-p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
-p.resetDebugVisualizerCamera(3, 0, -40, [0, 0, 0])
+# ---------------- Simulation runner ----------------
+class SlipSimulator:
+    def __init__(self, grid_w=GRID_W, grid_h=GRID_H, tile_types=TILE_TYPES):
+        self.grid_w = grid_w
+        self.grid_h = grid_h
+        self.tile_types = tile_types
+        self.tile_order = list(tile_types.keys())
 
-# 버튼 & 상태창
-repeat_button = p.addUserDebugParameter("Repeat Simulation", 1, 0, 0)
-reset_button = p.addUserDebugParameter("Reset Counts", 1, 0, 0)
+        # Stats
+        self.total_runs = 0
+        self.slip_counts = {k: 0 for k in self.tile_order}
 
-# --- 데이터 저장용 ---
-tile_slip_counts = {t: 0 for t in TILE_TYPES}
-total_runs = 0
+        # Thread-safe queue for reporting run results to GUI thread
+        self.result_queue = queue.Queue()
 
-def run_simulation():
-    global total_runs
-    p.resetSimulation()
-    p.setGravity(0, 0, -9.8)
+        # Protect stats if accessed from multiple threads
+        self._lock = threading.Lock()
 
-    # 바닥 생성
-    plane = p.loadURDF("plane.urdf")
+    def reset_stats(self):
+        with self._lock:
+            self.total_runs = 0
+            for k in self.slip_counts:
+                self.slip_counts[k] = 0
 
-    # 타일 배치
-    tile_ids = []
-    start_x = -(GRID_W * TILE_SIZE)/2
-    start_y = -(GRID_H * TILE_SIZE)/2
+    def get_stats_snapshot(self):
+        with self._lock:
+            # return copy for GUI
+            return self.total_runs, dict(self.slip_counts)
 
-    tiles = random.sample(list(TILE_TYPES.items()), GRID_W * GRID_H)
+    def _create_random_tile_layout(self, start_x, start_y):
+        """Return list of (body_id, name, mu, x, y) for created tiles."""
+        # Randomly choose tile types to fill grid (could be deterministic if desired)
+        types_list = [random.choice(self.tile_order) for _ in range(self.grid_w * self.grid_h)]
+        tile_infos = []
+        for i, name in enumerate(types_list):
+            mu = self.tile_types[name]
+            x = start_x + (i % self.grid_w + 0.5) * TILE_SIZE
+            y = start_y + (i // self.grid_w + 0.5) * TILE_SIZE
+            # create tile collision/visual
+            col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01])
+            vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01],
+                                      rgbaColor=[random.random(), random.random(), random.random(), 1])
+            tid = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                     basePosition=[x, y, -0.01])
+            p.changeDynamics(tid, -1, lateralFriction=max(0.01, mu))
+            tile_infos.append((tid, name, mu, x, y))
+        return tile_infos
 
-    for i, (name, mu) in enumerate(tiles):
-        x = start_x + (i % GRID_W + 0.5) * TILE_SIZE
-        y = start_y + (i // GRID_W + 0.5) * TILE_SIZE
-        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01])
-        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01],
-                                  rgbaColor=[random.random(), random.random(), random.random(), 1])
-        t_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
-                                 basePosition=[x, y, -0.01])
-        p.changeDynamics(t_id, -1, lateralFriction=mu)
-        tile_ids.append((t_id, name, mu))
+    def run_single(self, seed=None):
+        """Run one simulation. This runs in the background thread."""
+        if seed is not None:
+            random.seed(seed)
+        # Use DIRECT so no separate PyBullet GUI pops up
+        physics_client = p.connect(p.DIRECT)
+        try:
+            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            p.resetSimulation()
+            p.setGravity(0, 0, -9.81)
+            p.setTimeStep(SIM_STEP)
 
-    # 사람(캡슐)
-    person_col = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.2, height=0.6)
-    person_vis = p.createVisualShape(p.GEOM_CAPSULE, radius=0.2, length=0.6, rgbaColor=[0.2, 0.4, 0.8, 1])
-    person = p.createMultiBody(baseMass=70, baseCollisionShapeIndex=person_col,
-                               baseVisualShapeIndex=person_vis,
-                               basePosition=[start_x + 0.5, 0, 0.8])
+            # ground plane (visual baseline)
+            plane = p.loadURDF("plane.urdf")
 
-    p.resetBaseVelocity(person, [1.5, 0, 0])
+            # tile grid
+            start_x = - (self.grid_w * TILE_SIZE) / 2.0
+            start_y = - (self.grid_h * TILE_SIZE) / 2.0
+            tile_infos = self._create_random_tile_layout(start_x, start_y)
 
-    t, frame = 0, 0
-    slips_this_run = set()
+            # a simple "person" capsule body
+            collision = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.2, height=0.6)
+            vis = p.createVisualShape(p.GEOM_CAPSULE, radius=0.2, length=0.6, rgbaColor=[0.2, 0.4, 0.8, 1])
+            person = p.createMultiBody(baseMass=75.0, baseCollisionShapeIndex=collision, baseVisualShapeIndex=vis,
+                                       basePosition=[start_x + TILE_SIZE*0.5, 0, 0.8])
 
-    while t < SIM_DURATION:
-        contacts = p.getContactPoints(person)
-        for c in contacts:
-            other = c[2]
-            for tid, name, mu in tile_ids:
-                if other == tid:
-                    vel, _ = p.getBaseVelocity(person)
-                    v = math.hypot(vel[0], vel[1])
-                    p_slip = compute_p_slip(mu, v)
-                    if random.random() < p_slip:
-                        slip_impulse = [vel[0]*30, vel[1]*30, 0]
-                        p.applyExternalImpulse(person, -1, slip_impulse, c[5], p.WORLD_FRAME)
-                        tile_slip_counts[name] += 1
-                        slips_this_run.add(name)
-        p.stepSimulation()
-        time.sleep(SIM_STEP)
-        t += SIM_STEP
-        frame += 1
+            # give initial forward velocity to make it slide across tiles
+            p.resetBaseVelocity(person, linearVelocity=[1.5, 0, 0])
 
-    total_runs += 1
-    return slips_this_run
+            # Run sim loop
+            elapsed = 0.0
+            slips_this_run = {}  # counts per tile type in this run
+            for name in self.tile_order:
+                slips_this_run[name] = 0
 
-def display_stats():
-    text = f"Total Runs: {total_runs}\n"
-    for name, count in tile_slip_counts.items():
-        text += f"{name:16s}: {count} slips\n"
-    p.addUserDebugText(text, [-3, -2, 2], textColorRGB=[1,1,1], textSize=1.2, replaceItemUniqueId=1)
+            while elapsed < SIM_DURATION:
+                contacts = p.getContactPoints(bodyA=person)
+                # process contacts
+                for c in contacts:
+                    other = c[2]  # other body id
+                    # find which tile this is (if any)
+                    for tid, name, mu, tx, ty in tile_infos:
+                        if tid != other:
+                            continue
+                        # approximate tangential speed by base linear velocity
+                        lin_vel, _ = p.getBaseVelocity(person)
+                        tangential_speed = math.hypot(lin_vel[0], lin_vel[1])
+                        # simple wet detection: if tile name contains 'wet'
+                        wet = ('wet' in name)
+                        p_slip = compute_p_slip(mu, tangential_speed, wet=wet)
+                        if random.random() < p_slip:
+                            # apply lateral impulse to emulate slip
+                            slip_impulse = [lin_vel[0] * 20.0, lin_vel[1] * 20.0, 0]
+                            p.applyExternalImpulse(person, -1, slip_impulse, c[5], p.WORLD_FRAME)
+                            slips_this_run[name] += 1
+                p.stepSimulation()
+                time.sleep(SIM_STEP)  # small sleep to avoid hogging CPU
+                elapsed += SIM_STEP
 
-# --- 메인 루프 ---
-print("▶ PyBullet Slip Simulation GUI 시작")
-last_repeat = 0
-last_reset = 0
+            # update global stats
+            with self._lock:
+                self.total_runs += 1
+                for name, cnt in slips_this_run.items():
+                    self.slip_counts[name] += cnt
 
-while True:
-    display_stats()
+            # put summary into queue to inform GUI
+            self.result_queue.put((True, slips_this_run))
+        except Exception as e:
+            # send error to GUI
+            self.result_queue.put((False, str(e)))
+        finally:
+            p.disconnect(physics_client)
 
-    repeat_now = p.readUserDebugParameter(repeat_button)
-    reset_now = p.readUserDebugParameter(reset_button)
+# ---------------- GUI ----------------
+class SlipGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("PyBullet Slip Simulator (Tkinter + matplotlib)")
+        self.sim = SlipSimulator()
 
-    # 버튼 눌림 감지 (toggle)
-    if repeat_now != last_repeat and repeat_now > 0.5:
-        print("\n🔁 시뮬레이션 반복 실행 중...\n")
-        slips = run_simulation()
-        print(f"이번 회차에서 미끄러진 타일들: {slips}\n")
+        # Left: controls
+        ctrl_frame = ttk.Frame(root)
+        ctrl_frame.grid(row=0, column=0, sticky="ns", padx=6, pady=6)
 
-    if reset_now != last_reset and reset_now > 0.5:
-        print("\n♻️ 통계 초기화!\n")
-        tile_slip_counts = {t: 0 for t in TILE_TYPES}
-        total_runs = 0
+        ttk.Label(ctrl_frame, text="Simulation controls").grid(row=0, column=0, pady=(0,6))
+        self.run_button = ttk.Button(ctrl_frame, text="Run (1)", command=self.run_once)
+        self.run_button.grid(row=1, column=0, sticky="ew", pady=2)
 
-    last_repeat = repeat_now
-    last_reset = reset_now
+        repeat_frame = ttk.Frame(ctrl_frame)
+        repeat_frame.grid(row=2, column=0, sticky="ew", pady=2)
+        ttk.Label(repeat_frame, text="Repeat N:").grid(row=0, column=0)
+        self.repeat_var = tk.IntVar(value=5)
+        self.repeat_entry = ttk.Entry(repeat_frame, textvariable=self.repeat_var, width=6)
+        self.repeat_entry.grid(row=0, column=1, padx=(4,0))
+        self.repeat_button = ttk.Button(ctrl_frame, text="Repeat", command=self.run_repeat)
+        self.repeat_button.grid(row=3, column=0, sticky="ew", pady=2)
 
-    time.sleep(0.2)
+        self.reset_button = ttk.Button(ctrl_frame, text="Reset Stats", command=self.reset_stats)
+        self.reset_button.grid(row=4, column=0, sticky="ew", pady=8)
+
+        self.status_label = ttk.Label(ctrl_frame, text="Idle", foreground="blue")
+        self.status_label.grid(row=5, column=0, pady=(8,0))
+
+        # Right: matplotlib chart
+        fig = Figure(figsize=(7,4))
+        self.ax = fig.add_subplot(111)
+        self.ax.set_title("Slip counts per tile type")
+        self.ax.set_xlabel("Tile type")
+        self.ax.set_ylabel("Slip count (cumulative)")
+        self.canvas = FigureCanvasTkAgg(fig, master=root)
+        self.canvas.get_tk_widget().grid(row=0, column=1, padx=6, pady=6)
+        self.bar_containers = None
+
+        # periodic GUI update (to process results from simulation thread)
+        self.root.after(200, self._periodic_update)
+
+        # lock to prevent multiple concurrent runs
+        self._running = False
+        self._worker_thread = None
+
+        # initial plot
+        self._draw_chart()
+
+    def _draw_chart(self):
+        total_runs, counts = self.sim.get_stats_snapshot()
+        names = TILE_ORDER
+        values = [counts.get(n, 0) for n in names]
+
+        self.ax.clear()
+        self.ax.set_xlabel("Tile type")
+        self.ax.set_ylabel("Slip count (cumulative)")
+        self.ax.set_title(f"Slip counts per tile type (runs={total_runs})")
+        x = list(range(len(names)))
+        bars = self.ax.bar(x, values)
+        self.ax.set_xticks(x)
+        self.ax.set_xticklabels(names, rotation=30, ha='right')
+        self.canvas.draw()
+        self.bar_containers = bars
+
+    def _set_ui_enabled(self, enabled: bool):
+        state = "normal" if enabled else "disabled"
+        self.run_button.config(state=state)
+        self.repeat_button.config(state=state)
+        self.reset_button.config(state=state)
+        self.repeat_entry.config(state=state)
+
+    def run_once(self):
+        if self._running:
+            return
+        self._running = True
+        self._set_ui_enabled(False)
+        self.status_label.config(text="Running 1 simulation...", foreground="green")
+        self._worker_thread = threading.Thread(target=self._worker_run, args=(1,), daemon=True)
+        self._worker_thread.start()
+
+    def run_repeat(self):
+        if self._running:
+            return
+        try:
+            n = int(self.repeat_var.get())
+        except Exception:
+            messagebox.showerror("Invalid", "Repeat N must be integer")
+            return
+        if n <= 0:
+            messagebox.showerror("Invalid", "Repeat N must be > 0")
+            return
+        self._running = True
+        self._set_ui_enabled(False)
+        self.status_label.config(text=f"Running {n} simulations...", foreground="green")
+        self._worker_thread = threading.Thread(target=self._worker_run, args=(n,), daemon=True)
+        self._worker_thread.start()
+
+    def reset_stats(self):
+        if self._running:
+            return
+        self.sim.reset_stats()
+        self._draw_chart()
+        self.status_label.config(text="Stats reset", foreground="blue")
+
+    def _worker_run(self, n_runs: int):
+        """Background worker to run n_runs sequential simulations."""
+        for i in range(n_runs):
+            self.sim.run_single()
+            # after each run, we can sleep a little (optional)
+            # tiny delay so GUI can remain responsive
+            time.sleep(0.05)
+        # mark finished by placing a sentinel in queue (or update state directly)
+        self.result_queue = self.sim.result_queue  # ensure reference
+        # set flag to allow GUI to re-enable controls in periodic update
+        # We'll set _running=False when periodic update sees no running worker thread
+        # but to be safe, we set a flag:
+        # put special message
+        self.sim.result_queue.put((True, {"__runner_done__": True}))
+
+    def _periodic_update(self):
+        # process result queue messages
+        processed_any = False
+        while not self.sim.result_queue.empty():
+            processed_any = True
+            ok, payload = self.sim.result_queue.get()
+            if not ok:
+                # error reported
+                self.status_label.config(text=f"Error: {payload}", foreground="red")
+                self._running = False
+                self._set_ui_enabled(True)
+                continue
+            # payload is either slips_this_run dict or special done signal
+            if isinstance(payload, dict) and payload.get("__runner_done__"):
+                # worker finished
+                self._running = False
+                self._set_ui_enabled(True)
+                self.status_label.config(text="Idle", foreground="blue")
+            else:
+                # normal single-run summary
+                # update status briefly
+                summary = ", ".join([f"{k}:{v}" for k, v in payload.items() if v > 0])
+                if summary == "":
+                    summary = "no slips this run"
+                self.status_label.config(text=f"Last run: {summary}", foreground="black")
+        if processed_any:
+            # redraw chart after processing messages
+            self._draw_chart()
+
+        # schedule next periodic update
+        self.root.after(200, self._periodic_update)
+
+# ---------------- Main ----------------
+def main():
+    root = tk.Tk()
+    app = SlipGUI(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
