@@ -1,0 +1,144 @@
+# pybullet_slip_sim.py
+import pybullet as p
+import pybullet_data
+import time
+import random
+import math
+
+# ---------- 설정(튜닝 가능한 값) ----------
+MU_SAFE = 0.42             # ANSI 권장 레벨(레벨 습윤 기준)
+BASE_PROB = 0.6            # 기본 미끄럼 확률 계수
+V_REF = 1.0                # 속도 정규화 기준 (m/s)
+WET_FACTOR = 1.8           # 젖음 계수 (1.0 = 건조)
+
+TILE_SIZE = 1.0            # 타일 한 변 길이 (m)
+GRID_W = 6
+GRID_H = 4
+
+SIM_STEP = 1. / 240.
+SIM_DURATION = 20          # 초
+
+# ---------- 타일 정의(타입별 DCOF 추정값) ----------
+TILE_TYPES = {
+    "polished_marble": {"mu": 0.28, "desc": "광택 대리석 (매우 미끄러움)"},
+    "glazed_porcelain": {"mu": 0.35, "desc": "유약 포셀린 (광택형)"},
+    "matte_porcelain": {"mu": 0.48, "desc": "무광/텍스처 포셀린 (미끄럼 저항 좋음)"},
+    "quarry_tile": {"mu": 0.6, "desc": "언글레이즈/큐어리 (거칠음)"},
+    "terracotta": {"mu": 0.55, "desc": "테라코타 (중간 이상)"},
+    "vinyl": {"mu": 0.38, "desc": "비닐 (중간)"},
+    "concrete_wet": {"mu": 0.2, "desc": "젖은 콘크리트 (매우 위험)"}
+}
+
+# 간단한 매핑: 그리드의 각 타일에 무작위 타입 배치
+import itertools
+tile_grid_types = []
+all_types = list(TILE_TYPES.keys())
+for y in range(GRID_H):
+    row = []
+    for x in range(GRID_W):
+        # 테스트 목적으로 중앙에 미끄러운 것 배치해보기
+        choice = random.choice(all_types)
+        row.append(choice)
+    tile_grid_types.append(row)
+
+# ---------- PyBullet 초기화 ----------
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.resetSimulation()
+p.setGravity(0, 0, -9.81)
+p.setTimeStep(SIM_STEP)
+
+# 바닥(시각용, 실제 타일은 thin boxes로 생성)
+plane_id = p.loadURDF("plane.urdf")
+
+# ---------- 타일(박스) 생성 ----------
+tile_ids = {}
+start_x = - (GRID_W * TILE_SIZE) / 2.0
+start_y = - (GRID_H * TILE_SIZE) / 2.0
+tile_z = 0.0
+
+for yi in range(GRID_H):
+    for xi in range(GRID_W):
+        tile_type = tile_grid_types[yi][xi]
+        cx = start_x + (xi + 0.5) * TILE_SIZE
+        cy = start_y + (yi + 0.5) * TILE_SIZE
+        # 박스(매우 얇게)
+        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01])
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01],
+                                  rgbaColor=[0.8, 0.8, 0.8, 1])
+        tile_body = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                      basePosition=[cx, cy, tile_z - 0.01])
+        # lateralFriction을 DCOF 기반으로 (간단하게 매핑)
+        mu = TILE_TYPES[tile_type]["mu"]
+        # pybullet의 lateralFriction은 상대적 값 — DCOF를 그대로 쓰진 않지만 비례관계로 사용
+        p.changeDynamics(tile_body, -1, lateralFriction=max(0.01, mu))
+        tile_ids[(xi, yi)] = {"id": tile_body, "type": tile_type, "mu": mu, "pos": (cx, cy)}
+
+# ---------- '사람' 단순화: 캡슐 + 작은 박스(상체) ----------
+start_pos = [start_x + TILE_SIZE*1.5, 0, 0.8]
+collision = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.2, height=0.6)
+vis = p.createVisualShape(p.GEOM_CAPSULE, radius=0.2, length=0.6, rgbaColor=[0.2, 0.4, 0.8, 1])
+person = p.createMultiBody(baseMass=75.0, baseCollisionShapeIndex=collision, baseVisualShapeIndex=vis,
+                           basePosition=start_pos)
+
+# 약간의 초기 속도(미끄러짐 유도)
+p.resetBaseVelocity(person, linearVelocity=[1.5, 0, 0])
+
+# ---------- 유틸리티: 슬립 확률 계산 ----------
+def slip_risk_from_mu(mu):
+    R = max(0.0, (MU_SAFE - mu) / MU_SAFE)
+    return R
+
+def compute_p_slip(mu, tangential_speed, wet=False):
+    R = slip_risk_from_mu(mu)
+    speed_factor = min(2.0, tangential_speed / V_REF)
+    wet_factor_local = WET_FACTOR if wet else 1.0
+    p_slip = BASE_PROB * R * speed_factor * wet_factor_local
+    return max(0.0, min(1.0, p_slip))
+
+# ---------- 시뮬레이션 루프 ----------
+t = 0.0
+frame = 0
+while t < SIM_DURATION:
+    # 1) 접촉 체크
+    contacts = p.getContactPoints(bodyA=person)
+    # getContactPoints returns contacts with all bodies; filter for tile bodies
+    for c in contacts:
+        other = c[2]  # id of other body
+        # find tile by id
+        tile_info = None
+        for key, val in tile_ids.items():
+            if val["id"] == other:
+                tile_info = val
+                tile_coords = key
+                break
+        if tile_info is None:
+            continue
+        # compute tangential velocity at contact point (approx: base linear velocity)
+        lin_vel, ang_vel = p.getBaseVelocity(person)
+        tangential_speed = math.hypot(lin_vel[0], lin_vel[1])
+        mu = tile_info["mu"]
+        # assume wet if tile type includes 'wet' or randomly (for demo we treat concrete_wet as wet)
+        wet = ("wet" in tile_info["type"]) or (tile_info["type"] == "concrete_wet")
+        p_slip = compute_p_slip(mu, tangential_speed, wet=wet)
+
+        # 랜덤으로 미끄러질지 결정
+        rnd = random.random()
+        if rnd < p_slip:
+            # 미끄러짐을 강제로 발생시키기: 접촉면 반대방향의 관성력(사실적으론 마찰 감소가지만 impulse로 처리)
+            # 접촉 법선 및 접촉 위치 사용
+            contact_pos = c[5]  # world contact position on bodyA
+            normal = c[7]       # contact normal on bodyA
+            # apply lateral impulse in current travel direction to simulate slip (reduce friction effect)
+            # impulse magnitude은 속도와 mu 기반으로 결정 (튜닝 가능)
+            slip_impulse = [lin_vel[0] * 20.0, lin_vel[1] * 20.0, 0]
+            p.applyExternalImpulse(person, -1, slip_impulse, contact_pos, p.WORLD_FRAME)
+            # 시각 디버그
+            print(f"[FRAME {frame}] SLIP on tile {tile_info['type']} at {tile_coords} mu={mu:.2f} v={tangential_speed:.2f} p_slip={p_slip:.2f}")
+    # step
+    p.stepSimulation()
+    time.sleep(SIM_STEP)
+    t += SIM_STEP
+    frame += 1
+
+p.disconnect()
