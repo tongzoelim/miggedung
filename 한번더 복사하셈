@@ -1,0 +1,143 @@
+# slip_repeat_sim.py
+import pybullet as p
+import pybullet_data
+import time
+import random
+import math
+
+# --- 설정 ---
+MU_SAFE = 0.42
+BASE_PROB = 0.6
+V_REF = 1.0
+WET_FACTOR = 1.8
+
+TILE_SIZE = 1.0
+GRID_W, GRID_H = 4, 3
+SIM_STEP = 1./240.
+SIM_DURATION = 10  # 시뮬레이션 1회당 시간(초)
+
+TILE_TYPES = {
+    "polished_marble": 0.28,
+    "glazed_porcelain": 0.35,
+    "matte_porcelain": 0.48,
+    "quarry_tile": 0.6,
+    "terracotta": 0.55,
+    "vinyl": 0.38,
+    "concrete_wet": 0.2
+}
+
+# --- 함수들 ---
+def slip_risk_from_mu(mu):
+    return max(0.0, (MU_SAFE - mu) / MU_SAFE)
+
+def compute_p_slip(mu, v):
+    R = slip_risk_from_mu(mu)
+    speed_factor = min(2.0, v / V_REF)
+    return BASE_PROB * R * speed_factor * WET_FACTOR
+
+# --- PyBullet 초기화 ---
+p.connect(p.GUI)
+p.setAdditionalSearchPath(pybullet_data.getDataPath())
+p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0)
+p.resetDebugVisualizerCamera(3, 0, -40, [0, 0, 0])
+
+# 버튼 & 상태창
+repeat_button = p.addUserDebugParameter("Repeat Simulation", 1, 0, 0)
+reset_button = p.addUserDebugParameter("Reset Counts", 1, 0, 0)
+
+# --- 데이터 저장용 ---
+tile_slip_counts = {t: 0 for t in TILE_TYPES}
+total_runs = 0
+
+def run_simulation():
+    global total_runs
+    p.resetSimulation()
+    p.setGravity(0, 0, -9.8)
+
+    # 바닥 생성
+    plane = p.loadURDF("plane.urdf")
+
+    # 타일 배치
+    tile_ids = []
+    start_x = -(GRID_W * TILE_SIZE)/2
+    start_y = -(GRID_H * TILE_SIZE)/2
+
+    tiles = random.sample(list(TILE_TYPES.items()), GRID_W * GRID_H)
+
+    for i, (name, mu) in enumerate(tiles):
+        x = start_x + (i % GRID_W + 0.5) * TILE_SIZE
+        y = start_y + (i // GRID_W + 0.5) * TILE_SIZE
+        col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01])
+        vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[TILE_SIZE/2, TILE_SIZE/2, 0.01],
+                                  rgbaColor=[random.random(), random.random(), random.random(), 1])
+        t_id = p.createMultiBody(baseMass=0, baseCollisionShapeIndex=col, baseVisualShapeIndex=vis,
+                                 basePosition=[x, y, -0.01])
+        p.changeDynamics(t_id, -1, lateralFriction=mu)
+        tile_ids.append((t_id, name, mu))
+
+    # 사람(캡슐)
+    person_col = p.createCollisionShape(p.GEOM_CAPSULE, radius=0.2, height=0.6)
+    person_vis = p.createVisualShape(p.GEOM_CAPSULE, radius=0.2, length=0.6, rgbaColor=[0.2, 0.4, 0.8, 1])
+    person = p.createMultiBody(baseMass=70, baseCollisionShapeIndex=person_col,
+                               baseVisualShapeIndex=person_vis,
+                               basePosition=[start_x + 0.5, 0, 0.8])
+
+    p.resetBaseVelocity(person, [1.5, 0, 0])
+
+    t, frame = 0, 0
+    slips_this_run = set()
+
+    while t < SIM_DURATION:
+        contacts = p.getContactPoints(person)
+        for c in contacts:
+            other = c[2]
+            for tid, name, mu in tile_ids:
+                if other == tid:
+                    vel, _ = p.getBaseVelocity(person)
+                    v = math.hypot(vel[0], vel[1])
+                    p_slip = compute_p_slip(mu, v)
+                    if random.random() < p_slip:
+                        slip_impulse = [vel[0]*30, vel[1]*30, 0]
+                        p.applyExternalImpulse(person, -1, slip_impulse, c[5], p.WORLD_FRAME)
+                        tile_slip_counts[name] += 1
+                        slips_this_run.add(name)
+        p.stepSimulation()
+        time.sleep(SIM_STEP)
+        t += SIM_STEP
+        frame += 1
+
+    total_runs += 1
+    return slips_this_run
+
+def display_stats():
+    text = f"Total Runs: {total_runs}\n"
+    for name, count in tile_slip_counts.items():
+        text += f"{name:16s}: {count} slips\n"
+    p.addUserDebugText(text, [-3, -2, 2], textColorRGB=[1,1,1], textSize=1.2, replaceItemUniqueId=1)
+
+# --- 메인 루프 ---
+print("▶ PyBullet Slip Simulation GUI 시작")
+last_repeat = 0
+last_reset = 0
+
+while True:
+    display_stats()
+
+    repeat_now = p.readUserDebugParameter(repeat_button)
+    reset_now = p.readUserDebugParameter(reset_button)
+
+    # 버튼 눌림 감지 (toggle)
+    if repeat_now != last_repeat and repeat_now > 0.5:
+        print("\n🔁 시뮬레이션 반복 실행 중...\n")
+        slips = run_simulation()
+        print(f"이번 회차에서 미끄러진 타일들: {slips}\n")
+
+    if reset_now != last_reset and reset_now > 0.5:
+        print("\n♻️ 통계 초기화!\n")
+        tile_slip_counts = {t: 0 for t in TILE_TYPES}
+        total_runs = 0
+
+    last_repeat = repeat_now
+    last_reset = reset_now
+
+    time.sleep(0.2)
